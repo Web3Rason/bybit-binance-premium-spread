@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5036 · Bybit×Binance 極端溢價→價差</title>
+<script src="lightweight-charts.standalone.js"></script>
+<style>
+  :root { --bg:#0e1117; --card:#161b22; --line:#30363d; --fg:#e6edf3;
+          --muted:#8b949e; --hot:#e74c3c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:"Segoe UI","Microsoft JhengHei",sans-serif; font-size:14px; }
+  header { padding:14px 22px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:18px; }
+  .sub { color:var(--muted); font-size:12px; margin-top:4px; }
+  .wrap { padding:14px 22px; }
+  .bar { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  input { background:var(--card); border:1px solid var(--line); color:var(--fg);
+          padding:6px 10px; border-radius:6px; }
+  .tablebox { max-height:30vh; overflow:auto; border:1px solid var(--line); border-radius:8px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { padding:6px 9px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; cursor:pointer; user-select:none;
+       position:sticky; top:0; background:var(--bg); z-index:1; }
+  td:first-child, th:first-child { text-align:left; }
+  tr.row:hover { background:#1c2230; cursor:pointer; }
+  tr.sel { background:#22304a !important; }
+  .pos { color:#3fb950; } .neg { color:var(--hot); }
+  .chartwrap { margin-top:14px; }
+  .meta { color:var(--muted); font-size:12px; margin-bottom:10px; line-height:1.9; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; background:#22272e; margin-right:6px; }
+  .panes { display:flex; flex-direction:column; gap:6px; }
+  .pane .plabel { font-size:11px; color:var(--muted); padding:2px 4px 3px; }
+  .plabel b.title { color:var(--fg); margin-right:10px; }
+  .plabel .lg { margin-right:13px; cursor:pointer; user-select:none; }
+  .plabel .lg.off { opacity:.35; text-decoration:line-through; }
+  .dot { display:inline-block; width:10px; height:2px; vertical-align:middle; margin-right:4px; }
+  .err { color:var(--hot); padding:20px; }
+  #tooltip { position:fixed; z-index:50; display:none; pointer-events:none;
+             background:rgba(22,27,34,.97); border:1px solid var(--line); border-radius:6px;
+             padding:7px 10px; font-size:11px; line-height:1.65; box-shadow:0 4px 18px rgba(0,0,0,.55); }
+  #tooltip .tt-time { color:var(--fg); font-weight:600; margin-bottom:4px; }
+  #tooltip .tt-row { white-space:nowrap; }
+  #tooltip .tt-grp { color:var(--muted); display:inline-block; width:42px; }
+  #tooltip .tt-v { margin-right:10px; font-variant-numeric:tabular-nums; }
+  .tinfo { background:var(--card); border:1px solid var(--line); border-radius:8px;
+           padding:12px 16px; margin-bottom:12px; }
+  .tinfo summary { cursor:pointer; font-weight:600; color:var(--fg); font-size:14px; }
+  .tinfo .body { margin-top:10px; color:var(--muted); font-size:12.5px; line-height:1.85; }
+  .tinfo b.hl { color:#F0B90B; }
+  .tinfo table { width:auto; margin-top:8px; border:1px solid var(--line); border-radius:6px; }
+  .tinfo th, .tinfo td { padding:5px 14px; }
+  .tinfo tr.best { background:#1d2b1d; }
+  .tinfo tr.best td { color:#3fb950; font-weight:600; }
+  .tinfo td.bad { color:var(--hot); }
+</style>
+</head>
+<body>
+<header>
+  <h1>5036 · Bybit × Binance 極端溢價 → 跨所價差</h1>
+  <div class="sub">點列看<b>整合互動圖（單一圖表雙軸）</b>：右軸＝價格 K 線、左軸＝百分比（溢價 / 價差 / 資費，含七夜預測資費 TWAP）。crosshair 數據顯示游標旁；點圖例開關該線。</div>
+</header>
+<div class="wrap">
+  <details id="thresholdInfo" class="tinfo" open></details>
+  <details id="convInfo" class="tinfo"></details>
+  <details id="xiyeInfo" class="tinfo" open></details>
+  <div class="bar">
+    <input id="q" placeholder="搜尋幣種…" oninput="render()">
+    <span class="sub" id="count"></span>
+  </div>
+  <div class="tablebox"><div id="tablebody"></div></div>
+  <div id="chartwrap" class="chartwrap"></div>
+</div>
+<div id="tooltip"></div>
+<script>
+const PREM_THR = 8;   // 即時告警建議門檻 %（8–12% 區間下限；2%/5% 為雜訊，見下方說明）
+let DATA = [], sortKey = "p99_abs_last_spread_pct", sortDir = -1, selected = null;
+let charts = [], series = {};
+let curData = null, timeIndex = null;
+const tip = document.getElementById("tooltip");
+
+const COLS = [
+  ["symbol", "幣種"], ["date", "日期"], ["peak_premium_pct", "峰值溢價%"],
+  ["p99_abs_last_spread_pct", "P99|價差|%"], ["max_abs_prem_spread_pct", "max|溢價差|%"],
+  ["spearman_premSpread_lastSpread", "Spearman"], ["corr_premSpread_lastSpread", "Pearson"],
+  ["lead", "溢價領先(分)"], ["interval", "週期BN/BB(h)"], ["cap", "cap BN/BB"],
+  ["usage", "使用率峰BN/BB"], ["median_abs_index_spread_pct", "指數差(中)%"],
+];
+function val(e, k) {
+  if (k === "date") return e.start_ms ? new Date(e.start_ms).toISOString().slice(0, 10) : "—";
+  if (k === "lead") return e.leadlag_premSpread_to_lastSpread?.lead_lag_min ?? null;
+  if (k === "interval") return `${e.bn_actual_interval_h ?? "—"}/${e.bb_actual_interval_h ?? "—"}`;
+  if (k === "cap") return `±${e.bn_cap ?? "—"}/±${e.bb_cap ?? "—"}`;
+  if (k === "usage") return `${e.bn_fr_usage_max ?? "—"}/${e.bb_fr_usage_max ?? "—"}`;
+  return e[k];
+}
+function sortVal(e, k) {
+  if (k === "date") return e.start_ms ?? -1e9;
+  if (k === "lead") return e.leadlag_premSpread_to_lastSpread?.lead_lag_min ?? -1e9;
+  if (["interval","cap","usage"].includes(k)) return e.bb_fr_usage_max ?? 0;
+  const v = e[k]; return (v === null || v === undefined) ? -1e9 : v;
+}
+function cls(k, v) {
+  if (typeof v !== "number") return "";
+  if (k.includes("premium") || k.includes("spread")) return v < 0 ? "neg" : "pos";
+  return "";
+}
+function render() {
+  const q = document.getElementById("q").value.trim().toUpperCase();
+  let rows = DATA.filter(e => !q || e.symbol.includes(q));
+  rows.sort((a, b) => (sortVal(a, sortKey) - sortVal(b, sortKey)) * sortDir);
+  document.getElementById("count").textContent = `${rows.length} 個事件`;
+  let h = "<table><thead><tr>";
+  for (const [k, label] of COLS) {
+    const arrow = k === sortKey ? (sortDir < 0 ? " ▼" : " ▲") : "";
+    h += `<th onclick="setSort('${k}')">${label}${arrow}</th>`;
+  }
+  h += "</tr></thead><tbody>";
+  for (const e of rows) {
+    h += `<tr class="row ${selected===e.series?'sel':''}" onclick="select('${e.series}')">`;
+    for (const [k] of COLS) { const v = val(e, k); h += `<td class="${cls(k, v)}">${v ?? "—"}</td>`; }
+    h += "</tr>";
+  }
+  document.getElementById("tablebody").innerHTML = h + "</tbody></table>";
+}
+function setSort(k) { if (k === sortKey) sortDir *= -1; else { sortKey = k; sortDir = -1; } render(); }
+
+// ── 互動圖 ──
+const CHART_OPTS = {
+  layout: { background: { color: "#0e1117" }, textColor: "#8b949e", fontSize: 11 },
+  grid: { vertLines: { color: "#1b1f27" }, horzLines: { color: "#1b1f27" } },
+  rightPriceScale: { borderColor: "#30363d" },
+  timeScale: { borderColor: "#30363d", timeVisible: true, secondsVisible: false },
+  crosshair: { mode: 0 },
+};
+// 單一整合圖表的所有線/K線。scale: right=價格軸(K線) / left=百分比軸(溢價+價差+資費)。
+// off:true = 預設隱藏(點圖例可開)。vkey=tooltip 取值欄；dkey=資料欄(與 series key 不同時用)。
+const SERIES = [
+  // 價格（右軸，K 線）
+  { grp:"價格", key:"bn_last", kind:"candle", scale:"right", vkey:"bn_last_c", unit:"", name:"BN 價格", up:"#26a69a", down:"#ef5350" },
+  { grp:"價格", key:"bb_last", kind:"candle", scale:"right", vkey:"bb_last_c", unit:"", name:"BY 價格", up:"#2196f3", down:"#ff9800" },
+  // 溢價（左軸 %）
+  { grp:"溢價", key:"bn_prem", kind:"line", scale:"left", vkey:"bn_prem", unit:"%", name:"BN 溢價", color:"#F0B90B" },
+  { grp:"溢價", key:"bb_prem", kind:"line", scale:"left", vkey:"bb_prem", unit:"%", name:"BY 溢價", color:"#1DA2B4" },
+  // 價差（左軸 %）
+  { grp:"價差", key:"last_spread", kind:"line", scale:"left", vkey:"last_spread", unit:"%", name:"真實價差", color:"#e74c3c" },
+  { grp:"價差", key:"prem_spread", kind:"line", scale:"left", vkey:"prem_spread", unit:"%", name:"溢價差",   color:"#a371f7" },
+  { grp:"價差", key:"mark_spread", kind:"line", scale:"left", vkey:"mark_spread", unit:"%", name:"標記價差", color:"#6e7681", lw:1, off:true },
+  // 資費（左軸 %）— 含七夜預測資費 TWAP
+  { grp:"資費", key:"bb_fr",   kind:"line", scale:"left", vkey:"bb_fr",   unit:"%", name:"BY 資費",        color:"#3fb950" },
+  { grp:"資費", key:"xy_twap", kind:"line", scale:"left", vkey:"xy_twap", unit:"%", name:"BY 預測資費TWAP", color:"#2ea043", dkey:"xy_twap", dash:true },
+  { grp:"資費", key:"bn_fr",   kind:"line", scale:"left", vkey:"bn_fr",   unit:"%", name:"BN 資費",        color:"#d29922", off:true },
+];
+const GROUPS = ["價格", "溢價", "價差", "資費"];
+
+function mkLine(colArr, timeArr) {
+  const out = [];
+  for (let i = 0; i < timeArr.length; i++) {
+    const v = colArr ? colArr[i] : null;
+    if (v !== null && v !== undefined) out.push({ time: timeArr[i], value: v });
+  }
+  return out;
+}
+function mkCandle(d, key) {
+  const o = d[key+"_o"], h = d[key+"_h"], l = d[key+"_l"], c = d[key+"_c"], t = d.time;
+  const out = [];
+  if (!o || !h || !l || !c) return out;
+  for (let i = 0; i < t.length; i++) {
+    if (o[i] != null && h[i] != null && l[i] != null && c[i] != null)
+      out.push({ time: t[i], open: o[i], high: h[i], low: l[i], close: c[i] });
+  }
+  return out;
+}
+// 預測資費 ≈ 本結算區間內「溢價的成長窗 TWAP」，每個結算區間(UTC 對齊)重置。近似七夜圖上會回頭追 premium 的綠線。
+// intervalH = 該幣結算週期(小時)。用 UTC 對齊的時間桶判定結算邊界（不靠費率值變化，才不會在費率持平時漏掉重置）。
+// 皆為近似：未含利率項/clamp；且用結算週期眾數，極端期(週期被切短)重置頻率會略保守。
+function computeTWAP(prem, time, intervalH) {
+  const out = new Array(prem.length).fill(null);
+  const seg = (intervalH || 8) * 3600;  // 每結算區間秒數（time 為 unix 秒）
+  let sum = 0, cnt = 0, curBucket = null;
+  for (let i = 0; i < prem.length; i++) {
+    const b = Math.floor(time[i] / seg);
+    if (b !== curBucket) { sum = 0; cnt = 0; curBucket = b; }  // 跨入新結算區間 → 重置
+    const p = prem[i];
+    if (p != null) { sum += p; cnt++; }
+    out[i] = cnt > 0 ? sum / cnt : null;
+  }
+  return out;
+}
+function valAt(key, t) {
+  if (!curData || t == null) return null;
+  const i = timeIndex.get(t);
+  return i == null ? null : curData[key]?.[i];
+}
+function fmtNum(v) {
+  const a = Math.abs(v);
+  if (a >= 1000) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(3);
+  return v.toFixed(5);
+}
+function fmtV(v, unit) { return (v == null) ? "—" : fmtNum(v) + unit; }
+function fmtTime(t) { return new Date(t * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC"; }
+
+function showTooltip(param) {
+  if (param.time === undefined || !param.point) { tip.style.display = "none"; return; }
+  const t = param.time;
+  let html = `<div class="tt-time">${fmtTime(t)}</div>`;
+  for (const g of GROUPS) {
+    const parts = SERIES
+      .filter(it => it.grp === g && series[it.key] && series[it.key].options().visible !== false)
+      .map(it => {
+        const c = it.kind === "candle" ? it.up : it.color;
+        return `<span class="tt-v"><span class="dot" style="background:${c}"></span>`
+             + `<b style="color:${c}">${fmtV(valAt(it.vkey, t), it.unit)}</b></span>`;
+      });
+    if (parts.length) html += `<div class="tt-row"><span class="tt-grp">${g}</span>${parts.join("")}</div>`;
+  }
+  tip.innerHTML = html;
+  tip.style.display = "block";
+  const r = document.getElementById("mainchart").getBoundingClientRect();
+  let x = r.left + param.point.x + 16, y = r.top + param.point.y + 16;
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  if (x + tw > window.innerWidth - 6) x = r.left + param.point.x - tw - 16;
+  if (y + th > window.innerHeight - 6) y = window.innerHeight - th - 6;
+  if (y < 6) y = 6;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+
+function disposeCharts() { charts.forEach(c => c.remove()); charts = []; series = {}; }
+
+function drawChart(d) {
+  disposeCharts();
+  curData = d;
+  if (d.bb_prem) d.xy_twap = computeTWAP(d.bb_prem, d.time, d._intervalH);  // 注入預測資費 TWAP
+  timeIndex = new Map(d.time.map((t, i) => [t, i]));
+  const el = document.getElementById("mainchart");
+  const chart = LightweightCharts.createChart(el, {
+    ...CHART_OPTS, height: 540, width: el.clientWidth,
+    leftPriceScale: { visible: true, borderColor: "#30363d" },   // 左軸 = 百分比
+    rightPriceScale: { visible: true, borderColor: "#30363d" },  // 右軸 = 價格
+  });
+  charts = [chart];
+
+  // 極限峰值溢價（供時間軸自動對焦 + 標記）
+  let peakTime = null, peakAbs = -1, peakKey = "bn_prem";
+  for (let i = 0; i < d.time.length; i++) {
+    const bn = Math.abs(d.bn_prem?.[i] ?? 0), bb = Math.abs(d.bb_prem?.[i] ?? 0);
+    const m = Math.max(bn, bb);
+    if (m > peakAbs) { peakAbs = m; peakTime = d.time[i]; peakKey = bn >= bb ? "bn_prem" : "bb_prem"; }
+  }
+  const PEAK_HALF = 90 * 60;
+  const peakFrom = peakTime != null ? Math.max(d.time[0], peakTime - PEAK_HALF) : null;
+  const peakTo = peakTime != null ? Math.min(d.time[d.time.length - 1], peakTime + PEAK_HALF) : null;
+
+  SERIES.forEach(it => {
+    let s;
+    if (it.kind === "candle") {
+      s = chart.addCandlestickSeries({ upColor: it.up, downColor: it.down, borderVisible: false,
+        wickUpColor: it.up, wickDownColor: it.down, priceScaleId: it.scale, visible: !it.off });
+      s.setData(mkCandle(d, it.key));
+    } else {
+      s = chart.addLineSeries({ color: it.color, lineWidth: it.lw || 2, lineStyle: it.dash ? 2 : 0,
+        priceScaleId: it.scale, priceLineVisible: false, lastValueVisible: true, visible: !it.off });
+      s.setData(mkLine(d[it.dkey || it.key], d.time));
+    }
+    series[it.key] = s;
+  });
+
+  // 百分比軸(左)：0 軸 + ±告警門檻虛線（掛在 bb_prem 這條左軸線上）
+  if (series.bb_prem) {
+    series.bb_prem.createPriceLine({ price: 0, color: "#484f58", lineWidth: 1, lineStyle: 1, axisLabelVisible: false });
+    for (const v of [PREM_THR, -PREM_THR]) {
+      series.bb_prem.createPriceLine({ price: v, color: "#8b949e", lineWidth: 1, lineStyle: 2,
+        axisLabelVisible: true, title: `門檻${v > 0 ? "+" : ""}${v}%` });
+    }
+  }
+  // 峰值標記
+  if (peakTime != null && series[peakKey]) {
+    const pv = d[peakKey][timeIndex.get(peakTime)];
+    series[peakKey].setMarkers([{ time: peakTime, position: pv >= 0 ? "aboveBar" : "belowBar",
+      color: "#e74c3c", shape: pv >= 0 ? "arrowDown" : "arrowUp", text: "極限峰值" }]);
+  }
+  // 對焦峰值附近
+  if (peakTime != null) chart.timeScale().setVisibleRange({ from: peakFrom, to: peakTo });
+  else chart.timeScale().fitContent();
+
+  chart.subscribeCrosshairMove(showTooltip);
+}
+
+function legendHtml() {  // 單一圖表：分組圖例，點擊 toggle 顯示/隱藏
+  return GROUPS.map(g => {
+    const items = SERIES.filter(it => it.grp === g).map(it => {
+      const c = it.kind === "candle" ? it.up : it.color;
+      return `<span class="lg${it.off ? " off" : ""}" onclick="toggleSeries('${it.key}',this)">`
+           + `<span class="dot" style="background:${c}"></span>${it.name}</span>`;
+    }).join("");
+    return `<b style="color:#8b949e;margin-right:4px">${g}</b>${items}`;
+  }).join(`<span style="color:#30363d;margin:0 6px">｜</span>`);
+}
+function toggleSeries(key, el) {
+  const s = series[key];
+  if (!s) return;
+  const vis = s.options().visible !== false;
+  s.applyOptions({ visible: !vis });
+  el.classList.toggle("off", vis);
+}
+
+async function select(file) {
+  selected = file;
+  render();
+  tip.style.display = "none";
+  const e = DATA.find(x => x.series === file);
+  const ll = e.leadlag_premSpread_to_lastSpread || {};
+  document.getElementById("chartwrap").innerHTML = `
+    <div class="meta">
+      <b style="font-size:14px;color:#e6edf3">${e.symbol}</b>　峰值溢價 ${e.peak_premium_pct}% @ ${e.peak_ex}<br>
+      <span class="pill">溢價↔價差 Spearman ${e.spearman_premSpread_lastSpread} (Pearson ${e.corr_premSpread_lastSpread})</span>
+      <span class="pill">溢價領先 ${ll.lead_lag_min ?? "—"} 分</span>
+      <span class="pill">P99|價差| ${e.p99_abs_last_spread_pct}%</span>
+      <span class="pill">週期 BN ${e.bn_actual_interval_h}h/BY ${e.bb_actual_interval_h}h</span>
+      <span class="pill">cap ±${e.bn_cap}/±${e.bb_cap}</span>
+      <span class="pill">指數差(中) ${e.median_abs_index_spread_pct}%</span>
+      ${e.suspect_diff_coin ? '<span class="pill" style="color:#e74c3c">⚠ 疑似同名不同幣</span>' : ''}
+    </div>
+    <div class="plabel" style="margin-bottom:6px;line-height:2.4">${legendHtml()}</div>
+    <div style="color:var(--muted);font-size:11px;margin-bottom:8px">左軸＝百分比（溢價 / 價差 / 資費）　右軸＝價格（K 線）。點圖例開關線，灰色系預設關閉；溢價/價差幅度大時資費會顯得平——想細看資費可先關掉溢價與價差。</div>
+    <div id="mainchart"></div>`;
+  try {
+    const d = await fetch("events_json/" + file + "?t=" + Date.now()).then(r => r.json());
+    d._intervalH = e.bb_actual_interval_h || 8;  // 結算週期(小時)，供 TWAP 每區間重置
+    drawChart(d);
+  } catch (err) {
+    document.getElementById("chartwrap").innerHTML += `<div class="err">讀取時序資料失敗：${err}</div>`;
+  }
+}
+
+window.addEventListener("resize", () => {
+  const el = document.getElementById("mainchart");
+  if (el && charts[0]) charts[0].applyOptions({ width: el.clientWidth });
+});
+
+function renderThresholdInfo(bt) {
+  const el = document.getElementById("thresholdInfo");
+  if (!el) return;
+  const iso = bt && bt.premium_thr_isolation;
+  const cost = (bt && bt.params_cost) || {};
+  const nEv = bt && bt.n_events;
+  const f = v => (v ?? "—");
+  let table = "", takeaway = "";
+  if (iso) {
+    const fp = iso.fixed_params, byT = iso.by_threshold;
+    let rows = "";
+    for (const r of byT) {
+      const pfNum = typeof r.profit_factor === "number";
+      const loss = r.total_pnl <= 0;
+      rows += `<tr class="${r.premium_thr === PREM_THR ? "best" : ""}">`
+        + `<td>${r.premium_thr}%</td><td>${r.n_trades}</td>`
+        + `<td class="${loss ? "bad" : ""}">${r.total_pnl > 0 ? "+" : ""}${r.total_pnl}%</td>`
+        + `<td>${(r.win_rate * 100).toFixed(1)}%</td>`
+        + `<td class="${pfNum && r.profit_factor < 1 ? "bad" : ""}">${f(r.profit_factor)}</td></tr>`;
+    }
+    table = `<table><thead><tr><th>溢價門檻</th><th>交易數</th><th>總PnL</th>`
+      + `<th>勝率</th><th>獲利因子</th></tr></thead><tbody>${rows}</tbody></table>`
+      + `<div style="margin-top:6px">固定參數：進場價差≥${f(fp.entry_sp)}%、收斂出場≤${f(fp.exit_sp)}%、`
+      + `停損≥${f(fp.stop_sp)}%、持有≤${f(fp.max_hold_h)}h；成本 4×(手續費${f(cost.fee)}%+滑點${f(cost.slip)}%)、`
+      + `進場延遲 ${f(cost.entry_delay_min)} 分。</div>`;
+    // 結論由數據動態生成，永不與表格打架（讀最低/最高門檻兩筆）
+    const lo = byT[0], hi = byT[byT.length - 1];
+    takeaway = `<b class="hl">門檻越低虧越凶</b>：最低 ${lo.premium_thr}% 總PnL ${lo.total_pnl}%（最差），`
+      + `提高到 ${hi.premium_thr}% 為 ${hi.total_pnl > 0 ? "+" : ""}${hi.total_pnl}%。`
+      + `低門檻把大量「無邊際的小溢價」當訊號，幾乎全是雜訊：`;
+  } else {
+    takeaway = "下表（需先跑 python backtest.py）：";
+    table = `<div class="err">尚無 backtest_result.json。</div>`;
+  }
+  el.innerHTML = `<summary>為何「即時告警門檻」要拉到 8–12%（而非直接看上表的峰值溢價）？</summary>`
+    + `<div class="body">`
+    + `① 表格「峰值溢價」欄＝每個事件<b class="hl">最極端的那一分鐘</b>（瞬間插針），數字偏大、分布也廣；`
+    + `但<b class="hl">峰值不是該觸發告警的水位</b>——盯峰值會高估事件「實際停留」的溢價。<br>`
+    + `② 溢價是一路爬升/下挫才到峰值——<b class="hl">門檻 ${PREM_THR}% 是它「第一次跨過」的水位</b>，`
+    + `等到 ±40% 才反應、行情大多走完。下方<b>溢價圖灰色虛線即 ±${PREM_THR}% 門檻</b>，可見溢價先穿過它才衝到峰值。<br>`
+    + `③ 隔離對照（${nEv ? `完整 ${nEv} 個事件窗` : "完整回測事件"}、固定其他參數、只改溢價門檻）：`
+    + takeaway + table
+    + `<div style="margin-top:8px;opacity:.85">⚠ 誠實標注：絕對盈虧另受出場/停損策略影響（此表為較有耐心的一組，是策略相對有利情境）。`
+    + `跨多組配置與成本實測，唯一穩健的是「<b class="hl">2%／5% 一律墊底、門檻越高越好</b>」的單調排序——`
+    + `故告警門檻建議 8–12%，<b>勿據單表斷言某門檻必獲利</b>。</div></div>`;
+}
+fetch("backtest_result.json?t=" + Date.now()).then(r => r.json()).then(renderThresholdInfo)
+  .catch(() => renderThresholdInfo(null));
+
+function renderConvInfo(cv) {
+  const el = document.getElementById("convInfo");
+  if (!el) return;
+  if (!cv) {
+    el.innerHTML = `<summary>峰值溢價／價差 → 收斂 EV（含資費 FR）</summary>`
+      + `<div class="body"><div class="err">尚無 convergence_ev.json，請先跑 python convergence_ev.py。</div></div>`;
+    return;
+  }
+  const p = cv.params || {}, d = cv.spread_dist || {}, pc = d.pcts || {};
+  const tbl = (rows, axis) => {
+    let h = `<table><thead><tr><th>${axis}</th><th>觸發</th><th>收斂率</th><th>毛EV</th>`
+      + `<th>其中資費FR</th><th>淨EV@${p.cost_ref}%</th><th>均MAE</th><th>P90 MAE</th>`
+      + `<th>中位持有</th><th>EV/MAE</th></tr></thead><tbody>`;
+    for (const r of (rows || [])) {
+      const good = r.ev_mae != null && r.ev_mae >= 1;
+      h += `<tr class="${good ? "best" : ""}">`
+        + `<td>≥${r.thr}%</td><td>${r.n}</td><td>${(r.conv_rate * 100).toFixed(0)}%</td>`
+        + `<td class="${r.gross_ev > 0 ? "" : "bad"}">${r.gross_ev > 0 ? "+" : ""}${r.gross_ev}%</td>`
+        + `<td class="${r.funding < 0 ? "bad" : ""}">${r.funding > 0 ? "+" : ""}${r.funding}%</td>`
+        + `<td class="${r.net_ev > 0 ? "" : "bad"}">${r.net_ev > 0 ? "+" : ""}${r.net_ev}%</td>`
+        + `<td>${r.mae_mean}%</td><td>${r.mae_p90}%</td><td>${r.hold_h_median}h</td>`
+        + `<td class="${good ? "" : "bad"}">${r.ev_mae ?? "—"}</td></tr>`;
+    }
+    return h + `</tbody></table>`;
+  };
+  // 「EV/MAE 首次 ≥1」由數據動態找，避免寫死數字與表格打架
+  const firstGE1 = rows => {
+    const r = (rows || []).find(x => x.ev_mae != null && x.ev_mae >= 1);
+    return r ? `≥${r.thr}%` : "網格內未達標";
+  };
+  el.innerHTML = `<summary>峰值溢價／價差 → 收斂 EV（含資費 FR，${cv.n_events} 事件）</summary>`
+    + `<div class="body">`
+    + `進場後賭「價差收斂」：出場＝價差收斂到 ≤${p.exit_floor}% 或持有滿 ${p.max_hold_h}h`
+    + `（進場延遲 ${p.entry_delay_min} 分防作弊）。`
+    + `<b class="hl">收斂率幾乎都 ~100%</b>——極端溢價最終幾乎必收斂；重點不是「會不會收」，`
+    + `而是要扛多少浮虧(MAE)、資費是賺是賠。<br>`
+    + `<b>① 溢價衝到多少 → 收斂 EV</b>（對齊告警門檻）：${tbl(cv.by_premium_thr, "溢價P")}`
+    + `<b style="display:block;margin-top:10px">② 進場價差到多少 → 收斂 EV</b>：${tbl(cv.by_entry_spread, "進場價差X")}`
+    + `<div style="margin-top:8px;opacity:.85">⚠ 讀法：<b class="hl">EV/MAE ≥1</b>（綠列）才代表期望收益大於要扛的浮虧——`
+    + `溢價軸要到 <b>${firstGE1(cv.by_premium_thr)}</b>、價差軸要到 <b>${firstGE1(cv.by_entry_spread)}</b> 才達標；`
+    + `低於此門檻雖淨EV多為正，但相對浮虧(MAE)偏高、性價比不足。`
+    + `<b>資費 FR 在持有期是小幅淨支出，不是收益來源</b>。`
+    + `價差分布：中位 ${d.median}%、P90 ${pc.p90}%、P99 ${pc.p99}%。</div></div>`;
+}
+fetch("convergence_ev.json?t=" + Date.now()).then(r => r.json()).then(renderConvInfo)
+  .catch(() => renderConvInfo(null));
+
+function renderXiyeInfo() {
+  const el = document.getElementById("xiyeInfo");
+  if (!el) return;
+  el.innerHTML = `<summary>七夜「溢價↔資費穿插收斂」訊號：驗證現況（點開）</summary>`
+    + `<div class="body">`
+    + `在整合圖的<b class="hl">百分比軸(左)</b>上，看 <b class="hl">BY 溢價</b> 與 <b class="hl">預測資費 TWAP</b>`
+    + `(綠，每結算區間重置的成長窗均值，會回頭追溢價) 的穿插；圖例「BY 資費」為已結算費率。`
+    + `<b>預測資費為近似值</b>(用 (mark−index)/index 溢價的 TWAP 估，未含利率項與 clamp)。<br>`
+    + `<b class="hl">結論拆兩塊，判決完全不同：</b>`
+    + `<table><thead><tr><th>主張</th><th>判決</th></tr></thead><tbody>`
+    + `<tr class="best"><td>因果解釋：「溢價歸0→資費歸0」「兩線穿插」能預測行情</td><td>❌ 高信心證偽</td></tr>`
+    + `<tr><td>「振幅收斂」本身有無擇時/出場價值</td><td class="bad">❓ 未判定（非證明無用）</td></tr>`
+    + `</tbody></table>`
+    + `<div style="margin-top:8px">`
+    + `<b>為何因果解釋是空的</b>：資費≈溢價的落後平均，所以「溢價歸0資費跟著歸0」是<b class="hl">定義恆等式</b>；`
+    + `「一條線繞著自己的均線穿來穿去」是<b class="hl">必然事件</b>，穿越本身資訊量≈0。<br>`
+    + `<b>為何未判定</b>：先前驗證用 3 幣/7 天全負溢價、有效樣本僅 3 段、對 20% 效應只有 21% 檢定力；`
+    + `且原本的殺手指標「R_remaining」在穿越點取值、結構上限僅 0.02~0.07，門檻設定失效已撤回。`
+    + `這是「沒有證據」，不是「證明沒用」。<br>`
+    + `<b class="hl">正確下一步＝肉眼＋讓七夜親手標點</b>：請他在圖上標 10~20 個他的訊號，再比對召回率，`
+    + `排除「我把偵測器寫錯、誤當成 pattern 沒用」的稻草人風險。`
+    + `<span style="color:#e74c3c">⚠ 綠線到底是「預測資費」還是「已結算資費」，穿越幾何差很大，仍待與七夜確認。</span>`
+    + `</div></div>`;
+}
+renderXiyeInfo();
+
+fetch("analysis.json?t=" + Date.now()).then(r => r.json()).then(d => {
+  DATA = (d.events || []).filter(e => e.series);
+  render();
+  if (DATA.length) select(DATA[0].series);
+}).catch(e => {
+  document.getElementById("tablebody").innerHTML =
+    `<div class="err">讀取 analysis.json 失敗：${e}<br>請先跑 scan.py → fetch_event.py → analyze.py。</div>`;
+});
+</script>
+</body>
+</html>
